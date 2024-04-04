@@ -3,7 +3,7 @@ import nmap
 scanner = nmap.PortScanner()
 
 # Define target IP address or hostname
-target = "scanme.nmap.org"
+target = "scanme.nmap.com"
 
 # Define Nmap options
 options = "-sS -sV -O -A -p 1-1000"
