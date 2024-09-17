@@ -1,0 +1,161 @@
+"""
+Done:
+Modified the code to only use the MainCompany_UUID
+
+ToDo:
+Write a function to pull assets
+Write a function to pull vulnerabilities for each asset
+Write a function to combine everything in a readable CSV
+Write a function to pull CVSS Score and VPR Score
+Write a function to just pull Vulnerabilities with Score and add the CVE If it has one
+
+Author: Luis Guzman Garcia
+Date: 06/17/2024
+Version: 2.6
+
+"""
+import requests
+import pandas as pd
+import os
+import logging
+import re
+from notebookutils import mssparkutils
+
+# Setting up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Constants (Replace with environment variables or secrets manager calls)
+VAULT_NAME = 'Your_Vault_Name'  # Replace with your actual Key Vault name
+SECRET_SCOPE = f'https://{VAULT_NAME}.vault.azure.net/'  # Secret scope to retrieve credentials
+KEY1 = "Tenable-accessKey"  # Tenable Access Key stored in secret
+KEY2 = "Tenable-secretKey"  # Tenable Secret Key stored in secret
+LOCAL_PATH = '/path/to/local/directory'  # Replace with the actual path you want to store files
+COMPASS_MSP_UUID = "Your_UUID"  # Use a UUID specific to your organization or client
+
+# Get credentials (Use secure method to retrieve credentials)
+access_key = mssparkutils.credentials.getSecret(SECRET_SCOPE, KEY1)
+secret_key = mssparkutils.credentials.getSecret(SECRET_SCOPE, KEY2)
+ 
+# Headers for API requests
+HEADERS = {
+    "accept": "application/json",
+    "X-ApiKeys": f"accessKey={access_key};secretKey={secret_key}"
+}
+
+# Ensure local path exists
+if not os.path.exists(LOCAL_PATH):
+    os.makedirs(LOCAL_PATH)
+
+# Function to get or refresh API key only when necessary
+api_key = {}
+
+def get_or_refresh_api_key():
+    global api_key
+    if not api_key:
+        api_key = generate_api_key(COMPASS_MSP_UUID)
+    return api_key
+
+def generate_api_key(uuid):
+    url = "https://cloud.tenable.com/mssp/accounts/mssp-child-keys"
+    payload = {"child_container_uuid": uuid}
+    headers = {
+        "accept": "application/json",
+        "X-ApiKeys": f"accessKey={access_key};secretKey={secret_key}"
+    }
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as e:
+        logging.error(f"Error generating API key for UUID {uuid}: {e}", exc_info=True)
+        return {}
+
+def get_assets(api_key):
+    url = "https://cloud.tenable.com/workbenches/assets"
+    headers = {
+        "accept": "application/json",
+        "X-ApiKeys": f"accessKey={api_key['access_key']};secretKey={api_key['secret_key']}"
+    }
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        assets_data = response.json()
+        return assets_data.get('assets', [])
+    except requests.RequestException as e:
+        logging.error(f"Error fetching assets: {e}", exc_info=True)
+        return []
+
+def get_vulnerability_data(api_key, asset_id):
+    url = f"https://cloud.tenable.com/workbenches/assets/{asset_id}/vulnerabilities"
+    headers = {
+        "accept": "application/json",
+        "X-ApiKeys": f"accessKey={api_key['access_key']};secretKey={api_key['secret_key']}"
+    }
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        vulnerabilities_data = response.json()
+        return vulnerabilities_data.get('vulnerabilities', [])
+    except requests.RequestException as e:
+        logging.error(f"Error fetching vulnerability data for asset ID {asset_id}: {e}", exc_info=True)
+        return []
+
+def extract_cve(vulnerability_name):
+    """Extract CVE ID from the vulnerability name."""
+    cve_match = re.search(r'CVE-\d{4}-\d{4,7}', vulnerability_name)
+    return cve_match.group(0) if cve_match else 'N/A'
+
+def create_csv_data(assets, api_key):
+    all_data = []
+    for asset in assets:
+        asset_id = asset['id']
+        vulnerabilities = get_vulnerability_data(api_key, asset_id)
+        for vuln in vulnerabilities:
+            # Only add vulnerabilities where CVSS or VPR scores are more than 1 and not 'N/A'
+            cvss_score = vuln.get('cvss_base_score', 'N/A')
+            vpr_score = vuln.get('vpr_score', 'N/A')
+
+            if (cvss_score != 'N/A' and float(cvss_score) > 1) or (vpr_score != 'N/A' and float(vpr_score) > 1):
+                vulnerability_name = vuln.get('plugin_name', 'N/A')
+                cve_id = extract_cve(vulnerability_name)
+
+                # Collecting vulnerability data
+                vuln_data = {
+                    'Asset ID': asset_id,
+                    'Hostname': asset.get('hostname', 'N/A'),
+                    'IP Address': asset.get('ipv4', 'N/A'),
+                    'Vulnerability Name': vulnerability_name,
+                    'Vulnerability ID': vuln.get('plugin_id', 'N/A'),
+                    'CVSS': cvss_score,
+                    'VPR Score': vpr_score,
+                    'CVE': cve_id,
+                    'Severity': vuln.get('severity', 'N/A'),
+                    'State': vuln.get('vulnerability_state', 'N/A')
+                    
+                }
+                all_data.append(vuln_data)
+    
+    # Creating a DataFrame and saving to CSV
+    df = pd.DataFrame(all_data)
+    filename = sanitize_filename("VulnDataV2.csv")
+    df.to_csv(os.path.join(LOCAL_PATH, filename), index=False)
+    logging.info(f"Comprehensive data saved to {os.path.join(LOCAL_PATH, filename)}")
+
+def sanitize_filename(filename):
+    invalid_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*', ' ']
+    return ''.join('_' if char in invalid_chars else char for char in filename)
+
+def main():
+    api_key = get_or_refresh_api_key()
+    if not api_key:
+        logging.error("API key generation failed. Exiting.")
+        return
+
+    assets = get_assets(api_key)
+    if assets:
+        create_csv_data(assets, api_key)
+    else:
+        logging.info("No assets retrieved.")
+
+if __name__ == "__main__":
+    main()
